@@ -21,6 +21,9 @@
 let quotedLinesIgnored = false;
 let ignoreQuotedLines = true;
 
+const ONERROR_REQ_INTERVAL = 1000;
+const ONERROR_REQ_MAX_TRIES = 10;
+
 Tools.getStorage().get({
     ignoreQuotedLines: ignoreQuotedLines,
 }, function(items) {
@@ -28,109 +31,116 @@ Tools.getStorage().get({
 });
 
 function getCheckResult(markupList, metaData, callback, errorCallback) {
-    Tools.getApiServerUrl(serverUrl => {
-      const startTime = new Date().getTime();
-      let text = Markup.markupList2text(markupList);
-      if (ignoreQuotedLines) {
-          const textOrig = text;
-          // A hack so the following replacements don't happen on messed up character positions.
-          // See https://github.com/languagetool-org/languagetool-browser-addon/issues/25:
-          text = text.replace(/^>.*?\n/gm, function(match) {
-              return " ".repeat(match.length - 1) + "\n";
-          });
-          quotedLinesIgnored = text != textOrig;
-      }
-      if (text.trim().length === 0) {
-        return callback('{}');
-      }
-      const req = new XMLHttpRequest();
-      req.timeout = 60 * 1000; // milliseconds
-      const url = serverUrl + (serverUrl.endsWith("/") ? "check" : "/check");
-      req.open('POST', url);
-      req.onload = function() {
-          let response = req.response;
-          if (!response) {
-              errorCallback(chrome.i18n.getMessage("noResponseFromServer", serverUrl), "noResponseFromServer");
-              return;
-          }
-          if (req.status !== 200) {
-              errorCallback(chrome.i18n.getMessage("noValidResponseFromServer", [serverUrl, req.response, req.status]), "noValidResponseFromServer");
-              return;
-          }
-          callback(response);
-          const runTime = new Date().getTime() - startTime;
-          if (runTime > 3000) {
-            const runTimeSecs = (runTime/1000).toFixed(0);
-            Tools.track("http://unknown.host", "SlowCheckSeconds", runTimeSecs);
-          }
-      };
-      req.onerror = function() {
-          errorCallback(chrome.i18n.getMessage("networkError", serverUrl), "networkError");
-      };
-      req.ontimeout = function() {
-          errorCallback(chrome.i18n.getMessage("timeoutError", serverUrl), "timeoutError");
-      };
-      let userAgent = "webextension";
-      if (Tools.isFirefox()) {
-          userAgent += "-firefox";
-      } else if (Tools.isChrome()) {
-          userAgent += "-chrome";
-      } else {
-          userAgent += "-unknown";
-      }
-      let params = 'disabledRules=WHITESPACE_RULE' +   // needed because we might replace quoted text by spaces (see issue #25)
-          '&useragent=' + userAgent;
-      Tools.getStorage().get({
-          havePremiumAccount: false,
-          username: "",
-          password: "",
-          motherTongue: false,
-          enVariant: "en-US",
-          deVariant: "de-DE",
-          ptVariant: "pt-PT",
-          caVariant: "ca-ES",
-      }, function(items) {
-          const { motherTongue, havePremiumAccount, username, password, enVariant, deVariant, ptVariant, caVariant } = items;
-          //console.log("metaData", metaData);
-          //console.log("havePremiumAccount", items.havePremiumAccount);
-          if (havePremiumAccount) {  // requires LT 3.9 or later
-              const json = {text: text, metaData: metaData};
-              params += '&data=' + encodeURIComponent(JSON.stringify(json));
-          } else {
-              params += '&text=' + encodeURIComponent(text);
-          }
-          if (motherTongue) {
-              params += "&motherTongue=" + motherTongue;
-          }
-          if (typeof manuallySelectedLanguage !== 'undefined' && manuallySelectedLanguage) {
-              params += "&language=" + manuallySelectedLanguage;
-              manuallySelectedLanguage = "";
-          } else {
-              params += "&language=auto";
-              let preferredVariants = [];
-              if (enVariant) {
-                  preferredVariants.push(enVariant);
-              }
-              if (deVariant) {
-                  preferredVariants.push(deVariant);
-              }
-              if (ptVariant) {
-                  preferredVariants.push(ptVariant);
-              }
-              if (caVariant) {
-                  preferredVariants.push(caVariant);
-              }
-              if (preferredVariants.length > 0) {
-                  params += "&preferredVariants=" + preferredVariants;
-              }
-          }
-          if (havePremiumAccount) {
-              params += "&username=" + encodeURIComponent(username) +
-                      "&password=" + encodeURIComponent(password);
-            req.send(params);
-        } else {
-            req.send(params);
+    let onerrorTryCounter = 0;
+    
+    const doCheck = serverUrl => {
+        const startTime = new Date().getTime();
+        let text = Markup.markupList2text(markupList);
+        if (ignoreQuotedLines) {
+            const textOrig = text;
+            // A hack so the following replacements don't happen on messed up character positions.
+            // See https://github.com/languagetool-org/languagetool-browser-addon/issues/25:
+            text = text.replace(/^>.*?\n/gm, function(match) {
+                return " ".repeat(match.length - 1) + "\n";
+            });
+            quotedLinesIgnored = text != textOrig;
         }
+        if (text.trim().length === 0) {
+          return callback('{}');
+        }
+        const req = new XMLHttpRequest();
+        req.timeout = 60 * 1000; // milliseconds
+        const url = serverUrl + (serverUrl.endsWith("/") ? "check" : "/check");
+        req.open('POST', url);
+        req.onload = function() {
+            let response = req.response;
+            if (!response) {
+                errorCallback(chrome.i18n.getMessage("noResponseFromServer", serverUrl), "noResponseFromServer");
+                return;
+            }
+            if (req.status !== 200) {
+                errorCallback(chrome.i18n.getMessage("noValidResponseFromServer", [serverUrl, req.response, req.status]), "noValidResponseFromServer");
+                return;
+            }
+            callback(response);
+            const runTime = new Date().getTime() - startTime;
+            if (runTime > 3000) {
+              const runTimeSecs = (runTime/1000).toFixed(0);
+              Tools.track("http://unknown.host", "SlowCheckSeconds", runTimeSecs);
+            }
+        };
+        req.onerror = function() {
+            errorCallback(chrome.i18n.getMessage("networkError", serverUrl), "networkError");
+            
+            if(++onerrorTryCounter < ONERROR_REQ_MAX_TRIES) {
+                setTimeout(() => doCheck(serverUrl), ONERROR_REQ_INTERVAL);
+            }
+        };
+        req.ontimeout = function() {
+            errorCallback(chrome.i18n.getMessage("timeoutError", serverUrl), "timeoutError");
+        };
+        let userAgent = "webextension";
+        if (Tools.isFirefox()) {
+            userAgent += "-firefox";
+        } else if (Tools.isChrome()) {
+            userAgent += "-chrome";
+        } else {
+            userAgent += "-unknown";
+        }
+        let params = 'disabledRules=WHITESPACE_RULE' +   // needed because we might replace quoted text by spaces (see issue #25)
+            '&useragent=' + userAgent;
+        Tools.getStorage().get({
+            havePremiumAccount: false,
+            username: "",
+            password: "",
+            motherTongue: false,
+            enVariant: "en-US",
+            deVariant: "de-DE",
+            ptVariant: "pt-PT",
+            caVariant: "ca-ES",
+        }, function(items) {
+            const { motherTongue, havePremiumAccount, username, password, enVariant, deVariant, ptVariant, caVariant } = items;
+            //console.log("metaData", metaData);
+            //console.log("havePremiumAccount", items.havePremiumAccount);
+            if (havePremiumAccount) {  // requires LT 3.9 or later
+                const json = {text: text, metaData: metaData};
+                params += '&data=' + encodeURIComponent(JSON.stringify(json));
+            } else {
+                params += '&text=' + encodeURIComponent(text);
+            }
+            if (motherTongue) {
+                params += "&motherTongue=" + motherTongue;
+            }
+            if (typeof manuallySelectedLanguage !== 'undefined' && manuallySelectedLanguage) {
+                params += "&language=" + manuallySelectedLanguage;
+                manuallySelectedLanguage = "";
+            } else {
+                params += "&language=auto";
+                let preferredVariants = [];
+                if (enVariant) {
+                    preferredVariants.push(enVariant);
+                }
+                if (deVariant) {
+                    preferredVariants.push(deVariant);
+                }
+                if (ptVariant) {
+                    preferredVariants.push(ptVariant);
+                }
+                if (caVariant) {
+                    preferredVariants.push(caVariant);
+                }
+                if (preferredVariants.length > 0) {
+                    params += "&preferredVariants=" + preferredVariants;
+                }
+            }
+            if (havePremiumAccount) {
+                params += "&username=" + encodeURIComponent(username) +
+                        "&password=" + encodeURIComponent(password);
+              req.send(params);
+          } else {
+              req.send(params);
+          }
     });
-  });
+  }
+    Tools.getApiServerUrl(doCheck);
 }
